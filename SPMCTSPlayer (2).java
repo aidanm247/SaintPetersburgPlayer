@@ -8,12 +8,20 @@ public class SPMCTSPlayer extends SPPlayer { // simplified and ported from
 
     double uctC = 2.0; // UCT exploration constant
     int numChanceSamples = 10; // Number of chance samples per chance node
-    int numIterations = 20000; // Number of MCTS iterations per move
+    int numIterations = 1000000; // Number of MCTS iterations per move
     int playoutTerminationDepth = 4; // Depth at which to terminate playouts
-    SPStateFeaturesLR1 features = new SPStateFeaturesLR1(); // Features for heuristic evaluation
+    AiDanStateFeaturesLR1 features = new AiDanStateFeaturesLR1(); // Features for heuristic evaluation
     boolean verbose = true; // Verbosity flag
     Random chanceSeedRng = new java.util.Random(); // RNG for chance seeds
     int nodes = 0; // Node counter
+    // time management fields
+    private long startMs = UNKNOWN_TIME; // start time of move computation
+    int endEstimatePlayouts = 3; // number of playouts to estimate the
+    //  number of remaining decisions
+    double fOpening = 1.1; // bias towards opening move search
+    // Hendrik Baier and Mark H.M. Winands, "Time Management for Monte-Carlo
+    //   Tree Search in Go" (ACG 2013)
+    // see also their "Time Management for Monte-Carlo Tree Search" (2016)
 
     public SPMCTSPlayer() {
         super("SPMCTSPlayer");
@@ -56,8 +64,8 @@ public class SPMCTSPlayer extends SPPlayer { // simplified and ported from
         }
 
         public String toString() {
-            return String.format("%d: Player: %d, Visits: %d, Q: %.2f, Children: %d",
-                    action, player, exploreCount, 
+            return String.format("%d: Player: %d, Visits: %d, Total Reward: %f, Q: %.2f, Children: %d",
+                    action, player, exploreCount, totalReward,
                     (exploreCount == 0 ? 0.0 : totalReward / exploreCount),
                     children.size()
             );
@@ -84,6 +92,7 @@ public class SPMCTSPlayer extends SPPlayer { // simplified and ported from
 
     @Override
     public int getAction(SPState state) {
+        startMs = System.currentTimeMillis();
         // get the legal actions for the current state,
         // compute the number of legal actions,
         // call MCTSSearch to get the root SearchNode,
@@ -103,14 +112,64 @@ public class SPMCTSPlayer extends SPPlayer { // simplified and ported from
     }
 
     public SearchNode MCTSSearch(SPState rootState) { // UCT_SEARCH
+        long turnSearchTimeMillis = 1000L; // default fixed time per move
+        if (timeRemainingMillis != UNKNOWN_TIME) {
+            // Estimate the number of decisions remaining (including this)
+            // For this we do a specified number of playouts, count the
+            //   current player decisions, and average.
+            int currentPlayer = rootState.playerTurn;
+            int totalDecisions = 0;
+            for (int p = 0; p < endEstimatePlayouts; p++) {
+                SPState simState = rootState.clone();
+                while (!simState.isGameOver()) {
+                    if (simState.playerTurn == currentPlayer) {
+                        totalDecisions++;
+                    }
+                    ArrayList<SPAction> legalActions = simState.getLegalActions();
+                    int actionIndex = (int) (Math.random() * legalActions.size());
+                    SPAction action = legalActions.get(actionIndex);
+                    simState = action.take();
+                }
+            }
+            double movesExpected = (double) totalDecisions / endEstimatePlayouts;
+            if (verbose) { // print the estimated number of decisions remaining
+                System.out.printf("Estimated decisions remaining: %.2f\n", movesExpected);
+            }
+            // Allocate time for this move
+            turnSearchTimeMillis = (long) (fOpening * timeRemainingMillis / movesExpected);
+            // Ensure that the move time is not more than a 20th of the remaining time
+            turnSearchTimeMillis = Math.min(turnSearchTimeMillis, 
+                timeRemainingMillis / 20L);
+        }
+        // Define variables to support periodic checking of the clock
+        int numBlockIterations = 100; // check time every 100 iterations
+        long lastIterationBlockMillis = UNKNOWN_TIME; // time since last check
+        long blockStartMillis = System.currentTimeMillis();
+
         SearchNode rootNode = new SearchNode(0, rootState.playerTurn);
         expand(rootNode, rootState);
         nodes = 1; // reset node counter
-        long startMillis = System.currentTimeMillis();
+        startMs = System.currentTimeMillis();
 
         List<SearchNode> path = new ArrayList<>(); // store sequence of
                                                 // SearchNodes visited
-        for (int iter = 0; iter < numIterations; iter++) {
+        for (int iter = 0; iter < numIterations; iter++) { // MCTS loop
+            // Check elapsed time every numBlockIterations
+            if ((iter + 1) % numBlockIterations == 0) {
+                long currentMillis = System.currentTimeMillis();
+                lastIterationBlockMillis = currentMillis - blockStartMillis;
+                long elapsedMillis = currentMillis - startMs;
+                // If another block of the same duration would exceed
+                // the allocated time, break
+                if (elapsedMillis + lastIterationBlockMillis > turnSearchTimeMillis) {
+                    if (verbose) {
+                        System.out.printf("MCTS terminating at iteration %d due to time limit.\n", iter + 1);
+                    }
+                    break;
+                }
+                blockStartMillis = currentMillis;
+            }
+
             SPState state = rootState.clone();
             path.clear();
             SearchNode node = rootNode;
@@ -145,42 +204,75 @@ public class SPMCTSPlayer extends SPPlayer { // simplified and ported from
                     // Use stored seed + action index to seed RNG
                     // Sample one of the chance outcomes
                     int sampleIndex = (int) (Math.random() * numChanceSamples);
-                    int sampleSeed = -nextNode.player + sampleIndex;
+                    int sampleSeed = nextNode.player + sampleIndex;
                     state = chanceAction.take(sampleSeed);
                     node = nextNode.children.get(sampleIndex);
                 } else {
-                    // Regular action node
-                    // TODO
+                    // Non-chance action node
+                    state = state.getLegalActions().get(nextNode.action).take();
+                    node = nextNode;
                 }
             }
-
-            // Expansion
-            if (!state.isTerminal()) {
-                expand(node, state);
-                // Choose one of the new children to continue
-                SearchNode nextNode = node.bestChildUCT();
-                path.add(nextNode);
-                SPAction action = state.getLegalActions().get(nextNode.action);
-                state.applyAction(action);
-                node = nextNode;
+            
+            // Simulation phase (DEFAULT_POLICY) and Evaluation
+            // Early playout termination (EPT) after a fixed depth
+            int stepsRemaining = playoutTerminationDepth;
+            while (!state.isGameOver() && stepsRemaining > 0) {
+                ArrayList<SPAction> legalActions = state.getLegalActions();
+                int actionIndex = (int) (Math.random() * legalActions.size());
+                SPAction action = legalActions.get(actionIndex);
+                state = action.take();
+                stepsRemaining--;
             }
 
-            // Simulation
-            double reward = SPPlayouts.simulatePlayout(state, playoutTerminationDepth, features);
+            // Evaluate the (possibly non-terminal) state
+            double[] returns = new double[state.numPlayers];
 
-            // Backpropagation
-            for (SearchNode visitedNode : path) {
-                visitedNode.exploreCount += 1;
-                visitedNode.totalReward += reward;
+            // NOTE: This assumes win probability, but would need to be
+            // modified for score difference
+            if (state.isGameOver()) {
+                // Terminal state: use actual returns
+                for (int i = 0; i < state.numPlayers; i++) {
+                    returns[i] = state.isWinner[i] ? 1.0 : 0.0;
+                }
+            } else {
+                // Non-terminal state: use heuristic evaluation
+                double winProb = features.predict(state);
+                if (state.playerTurn == 0) {
+                    returns[0] = winProb;
+                    returns[1] = 1.0 - winProb;
+                } else {
+                    returns[0] = 1.0 - winProb;
+                    returns[1] = winProb;
+                }
+                
+            }
+
+            // Backpropagation phase (BACKUP)
+           for (int i = path.size() - 1; i >= 0; i--) {
+                SearchNode n = path.get(i);
+                n.exploreCount += 1;
+                if (n.player >= 0) {
+                    // Non-chance node: back up the return for that player
+                    n.totalReward += returns[n.player];
+                }
+                else {
+                    // Chance node: acting player is in the child nodes
+                    int actingPlayer = path.get(i + 1).player;
+                    n.totalReward += returns[actingPlayer];
+                }
             }
         }
 
-
+        long endMillis = System.currentTimeMillis();
         if (verbose) {
-            System.out.println("Total nodes created: " + nodes);
-            System.out.println("Total seconds for MCTS: " +
-                    ((System.currentTimeMillis() - startMillis) / 1000.0)); 
+            System.out.printf("MCTS completed in %d ms, %d nodes created.\n",
+                    (endMillis - startMs), nodes);
+            // Print the root node and its children as well as the selected best child
+            System.out.println("Root Node:\n" + rootNode.toString());
+            System.out.println("Children:\n" + rootNode.childrenStr(rootNode.exploreCount, uctC));
         }
+    
         return rootNode;
     }
 
@@ -227,13 +319,14 @@ public class SPMCTSPlayer extends SPPlayer { // simplified and ported from
                     nodes++;
                 }
             } else {
-                // Regular action node
+                // Non-chance action node
                 SearchNode childNode = new SearchNode(a, player);
                 node.children.add(childNode);
                 nodes++;
             }
         }
 
+        
     }
 
 
